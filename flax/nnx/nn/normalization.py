@@ -181,6 +181,24 @@ def _normalize(
   return jnp.asarray(y, dtype)
 
 
+def _l2_normalize(x, axis=None, eps=1e-12):
+  """Normalizes along dimension `axis` using an L2 norm.
+
+  This specialized function exists for numerical stability reasons.
+
+  Args:
+    x: An input ndarray.
+    axis: Dimension along which to normalize, e.g. `1` to separately normalize
+      vectors in a batch. Passing `None` views `t` as a flattened vector when
+      calculating the norm (equivalent to Frobenius norm).
+    eps: Epsilon to avoid dividing by zero.
+
+  Returns:
+    An array of the same shape as 'x' L2-normalized along 'axis'.
+  """
+  return x * jax.lax.rsqrt((x * x).sum(axis=axis, keepdims=True) + eps)
+
+
 class BatchNorm(Module):
   """BatchNorm Module.
 
@@ -836,3 +854,127 @@ class GroupNorm(Module):
       self.dtype,
       self.epsilon,
     )
+
+
+class WeightNorm(Module):
+  """L2 weight normalization (https://arxiv.org/abs/1602.07868).
+
+  Weight normalization normalizes the weight params so that the l2-norm of
+  the matrix is equal to 1. This is implemented as a layer wrapper where
+  each wrapped layer will have its params l2-normalized before computing
+  its ``__call__`` output.
+
+  Example usage::
+  >>> from flax import nnx
+  >>> import jax.numpy as jnp
+  >>> linear_layer = nnx.Linear(in_features=2, out_features=3, rngs=nnx.Rngs(0))
+  >>> weight_norm_layer = nnx.WeightNorm(linear_layer, variable_filter=('kernel',), rngs=nnx.Rngs(1))
+  >>> x = jnp.ones((1, 2))
+  >>> x
+  Array([[1., 1.]], dtype=float32)
+  >>> output = weight_norm_layer(x)
+  >>> output
+  Array([[-0.10284233, -1.4139538 , -0.1648252 ]], dtype=float32)
+
+  Attributes:
+    layer_instance: Module instance that is wrapped with WeightNorm.
+    epsilon: A small float added to l2-normalization to avoid dividing by zero.
+    dtype: the dtype of the result (default: infer from input and params).
+    param_dtype: the dtype passed to parameter initializers (default: float32).
+    use_scale: If True, creates a learnable variable ``scale`` that is
+      multiplied to the normalized weights.
+    scale_init: Initialization function for the scaling variable.
+    feature_axes: The feature axes dimension(s). The l2-norm is calculated by
+      reducing the ``layer_instance`` variable over the remaining (non-feature)
+      axes. By default, the trailing dimension is treated as the feature axis.
+    variable_filter: An iterable of strings. Only the parameters whose key
+      (e.g. attribute name) contains one of these strings will have weight
+      normalization applied. By default, ``('kernel',)``.
+    rngs: RNG key(s) used for parameter initialization.
+  """
+
+  def __init__(
+    self,
+    layer_instance: Module,
+    *,
+    epsilon: float = 1e-6,
+    dtype: tp.Optional[Dtype] = None,
+    param_dtype: Dtype = jnp.float32,
+    use_scale: bool = True,
+    scale_init: Initializer = initializers.ones_init(),
+    feature_axes: Axes = -1,
+    variable_filter: tp.Iterable[str] = ('kernel',),
+    rngs: rnglib.Rngs,
+  ):
+    self.layer_instance = layer_instance
+    self.epsilon = epsilon
+    self.dtype = dtype
+    self.param_dtype = param_dtype
+    self.use_scale = use_scale
+    self.scale_init = scale_init
+    self.feature_axes = feature_axes
+    self.variable_filter = set(variable_filter)
+    self.rngs = rngs
+
+    for var_name in self.variable_filter:
+      if not hasattr(self.layer_instance, var_name):
+        raise ValueError(f"Wrapped layer with type '{type(self.layer_instance)}' does not have a parameter named '{var_name}'.")
+
+      v = getattr(self.layer_instance, var_name)
+      self.kernel_v = nnx.Param(v)
+
+      if self.use_scale:
+        if isinstance(self.feature_axes, int):
+          fa = self.feature_axes if self.feature_axes >= 0 else v.ndim + self.feature_axes
+          feature_shape = (v.shape[fa],)
+        else:
+          feature_shape = tuple(
+            v.shape[ax if ax >= 0 else v.ndim + ax] for ax in self.feature_axes
+          )
+        key = rngs.params()
+        self.kernel_g = nnx.Param(scale_init(key, feature_shape, v.dtype))
+      else:
+        self.kernel_g = None
+
+
+  def __call__(self, *args, **kwargs):
+
+    for var_name in self.variable_filter:
+      if not hasattr(self.layer_instance, var_name):
+        raise ValueError(
+          f"Wrapped layer {type(self.layer_instance)} does not have a parameter named '{var_name}'."
+        )
+
+      value = jnp.asarray(self.kernel_v)
+
+      if self.feature_axes is None:
+        feature_axes = ()
+        reduction_axes = tuple(i for i in range(value.ndim))
+      else:
+        feature_axes = _canonicalize_axes(value.ndim, self.feature_axes)
+        reduction_axes = tuple(
+          i for i in range(value.ndim) if i not in feature_axes
+        )
+
+      feature_shape = [1] * value.ndim
+      reduced_feature_shape = []
+      for ax in feature_axes:
+        feature_shape[ax] = value.shape[ax]
+        reduced_feature_shape.append(value.shape[ax])
+
+      value_bar = _l2_normalize(value, axis=reduction_axes, eps=self.epsilon)
+
+      g_param = self.kernel_g
+      if self.use_scale and g_param is not None:
+        g = g_param
+        g_shape = [1] * value.ndim
+        for ax, size in zip(feature_axes, g.shape):
+          g_shape[ax] = size
+        g = jnp.reshape(g, g_shape)
+        w = value_bar * g
+      else:
+        w = value / value_bar
+
+      getattr(self.layer_instance, var_name).value = w
+
+    return self.layer_instance(*args, **kwargs)
